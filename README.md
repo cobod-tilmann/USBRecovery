@@ -1,103 +1,126 @@
 # USBRecovery
 
-USBRecovery is a Linux-side USB-triggered recovery runner.
+USBRecovery is a Raspberry Pi USB-triggered recovery runner.
 
-When a USB partition is inserted, `udev` starts a `systemd` templated service, which runs a handler script on the host. The handler validates the device (label + token), mounts it, executes `scripts/RECOVERY.sh` from the USB via `/bin/bash`, logs everything, and unmounts when done.
+When a USB partition is inserted, `udev` triggers a `systemd` oneshot unit that runs `/usr/local/sbin/usb-recovery.sh`. The handler verifies a signed checksum manifest, then runs `scripts/RECOVERY.sh` via `/bin/bash` and mirrors output to Pi and USB logs.
 
-## What is in this repo
+## Security model
 
-- `installation.md`
-  - Manual, step-by-step setup guide for dependencies, host script, udev rule, systemd service, mount path, logging, and USB prep.
-- `installation script/install_usb_recovery.sh`
-  - One-shot installer that writes all required host files and activates the setup.
-- `USB drive structure/scripts/RECOVERY.sh`
-  - USB-side recovery wrapper that runs module scripts in sequence and appends structured logs.
+The handler executes recovery only if all gates pass:
 
-## Runtime architecture
+1. USB label matches `RECOVERYKEY`
+2. `scripts/manifest.sha256` signature verifies with `/etc/usb-recovery/cobod_recovery.pub`
+3. Manifest lines are valid and only allowed paths are present (`scripts/RECOVERY.sh`, `scripts/modules/*.sh`)
+4. `scripts/RECOVERY.sh` hash matches manifest
+5. Every `scripts/modules/*.sh` file hash matches manifest
+6. Coverage is strict: no extra modules on USB and no stale module entries in manifest
 
-1. USB partition insert event is captured by udev:
-   - Rule: `ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd*[0-9]", ENV{ID_BUS}=="usb"`
-2. udev requests `systemd` unit:
-   - `usb-recovery@%k.service`
-3. Service executes host handler:
-   - `/usr/local/sbin/usb-recovery.sh /dev/%I`
-4. Host handler validates and runs USB recovery:
-   - Device format check (`/dev/sdXn` pattern)
-   - Label check (`RECOVERYKEY`)
-   - Token file existence and content check (`COBOD_RECOVERY_OK_v1`)
-   - Mount handling with retry and cleanup trap
-   - Executes USB script: `/bin/bash <mount>/scripts/RECOVERY.sh`
-
-## USB-side expected structure
-
-Minimum required files on the USB root:
+## Expected USB structure
 
 ```text
 scripts/
   RECOVERY.sh
-  COBOD_TOKEN.txt
+  manifest.sha256
+  manifest.sha256.minisig
+  modules/
+  output/
 ```
 
-Logs are written under:
-
-```text
-scripts/output/
-```
-
-The wrapper script (`RECOVERY.sh`) expects module scripts in:
-
-```text
-scripts/modules/
-```
-
-Current module execution order in `RECOVERY.sh`:
-
-1. `netconfig_eth0_static.sh` (required)
-2. `systemstatus.sh` (optional)
-3. `list_interfaces.sh` (optional)
-
-`netconfig_wlan0_new.sh` is present as a commented-out step.
-
-## Logging behavior
-
-Host-side handler logs to:
+## Logging
 
 - Syslog/journal via `logger -t usb-recovery`
-- `/var/log/usb-recovery.log`
+- Pi log: `/var/log/usb-recovery.log`
+- USB mirror log: `scripts/output/pi-recovery.log`
+- Recovery wrapper log (from USB script): `scripts/output/recovery_wrapper.log`
 
-USB-side handler log mirror:
+## Install (offline-friendly)
 
-- `scripts/output/pi-recovery.log`
+Installer: `installation script/install_usb_recovery.sh`
 
-USB wrapper (`RECOVERY.sh`) writes its own module execution log:
+Before running installer:
 
-- `scripts/output/recovery_wrapper.log`
+- Place `cobod_recovery.pub` next to installer (unless already at `/etc/usb-recovery/cobod_recovery.pub`)
+- Ensure `minisign` is installed, or place one or more `minisign_*.deb` files in the installer directory
+- Ensure `sha256sum` is available on Pi (typically from `coreutils`)
 
-## Install options
-
-### Option A: Automated install
-
-Run the installer on the Linux host as root:
+Run:
 
 ```bash
 sudo bash "installation script/install_usb_recovery.sh"
 ```
 
-It creates:
+Minisign install behavior:
 
-- `/usr/local/sbin/usb-recovery.sh`
-- `/etc/udev/rules.d/99-usb-recovery.rules`
-- `/etc/systemd/system/usb-recovery@.service`
-- `/mnt/usb-recovery`
-- `/var/log/usb-recovery.log`
+- If minisign exists: continue
+- If missing and one `minisign_*.deb` exists: install via `dpkg -i`
+- If missing and multiple packages exist: prompt for selection
+- If missing and no local package exists: abort before making changes
 
-### Option B: Manual install
+## Signed package creation
 
-Follow `installation.md` for the full manual procedure.
+Use helper script (interactive + CI):
 
-## Important notes
+```bash
+bash "installation script/generate_manifest_and_sign.sh"
+```
 
-- The installer is fail-fast and aborts if target files already exist.
-- Scripts are executed with `/bin/bash` (works around missing exec bits on FAT32/exFAT).
-- Token validation strips CRLF/LF, so Windows-edited token files are accepted.
-- The expected USB volume label is `RECOVERYKEY`.
+Interactive quick guide:
+
+1. Run the command above
+2. For `Package root directory`, enter directory that contains `scripts/` (usually `USB drive structure`)
+3. Provide secret key path (for example `./cobod_recovery.key`)
+4. Optionally provide pubkey path for immediate verification
+5. Confirm overwrite if prompted
+
+Generated files:
+
+- `scripts/manifest.sha256`
+- `scripts/manifest.sha256.minisig`
+
+CI example:
+
+```bash
+bash "installation script/generate_manifest_and_sign.sh" \
+  --ci --force \
+  --root "USB drive structure" \
+  --key ./cobod_recovery.key \
+  --pubkey ./cobod_recovery.pub \
+  --verify
+```
+
+Detailed script guide:
+
+- `installation script/generate_manifest_and_sign.md`
+
+## Manual manifest creation (without helper script)
+
+Generate keypair once (keep private key offline):
+
+```bash
+minisign -G -p cobod_recovery.pub -s cobod_recovery.key
+```
+
+Build manifest:
+
+```bash
+shopt -s nullglob
+MODULE_FILES=(scripts/modules/*.sh)
+shopt -u nullglob
+{
+  echo "# USBRECOVERY-MANIFEST-V1"
+  sha256sum scripts/RECOVERY.sh "${MODULE_FILES[@]}"
+} > scripts/manifest.sha256
+```
+
+Sign manifest:
+
+```bash
+minisign -S -s cobod_recovery.key -m scripts/manifest.sha256 -x scripts/manifest.sha256.minisig
+```
+
+Copy to USB:
+
+- `scripts/RECOVERY.sh`
+- `scripts/modules/*.sh`
+- `scripts/manifest.sha256`
+- `scripts/manifest.sha256.minisig`

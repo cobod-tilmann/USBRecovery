@@ -1,0 +1,7 @@
+# Key material
+*.key
+*.pub
+*.pem
+*.p12
+*.pfx
+*.jwk

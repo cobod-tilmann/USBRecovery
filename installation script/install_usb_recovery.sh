@@ -3,7 +3,6 @@
 # purpose: install and set up auto-detect recovery system
 set -euo pipefail
 
-
 # ===== CONFIGURATION =====
 PISCRIPTPATH="/usr/local/sbin/usb-recovery.sh"
 UDEVRULEPATH="/etc/udev/rules.d/99-usb-recovery.rules"
@@ -11,43 +10,137 @@ SERVICEPATH="/etc/systemd/system/usb-recovery@.service"
 USBMOUNTDIR="/mnt/usb-recovery"
 LOGFILEPATH="/var/log/usb-recovery.log"
 
-# ===== CECK FOR ROOT ACCESS =====
-# Require root privileges (scrit run via sudo)
+PUBKEYDIR="/etc/usb-recovery"
+PUBKEYPATH="$PUBKEYDIR/cobod_recovery.pub"
+
+INSTALLER_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_PUBKEY_PATH="$INSTALLER_DIR/cobod_recovery.pub"
+
+check_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     echo "ERROR: This installer must be run as root."
     echo "Run: sudo bash $0"
     exit 1
   fi
+}
 
-# ===== CHECK IF FILES EXIST =====
-# check if script file already exists
-if [ -e "$PISCRIPTPATH" ]; then
+choose_minisign_package() {
+  local packages=()
+  local choice=""
+  local idx=""
+
+  shopt -s nullglob
+  packages=("$INSTALLER_DIR"/minisign_*.deb)
+  shopt -u nullglob
+
+  if [[ "${#packages[@]}" -eq 0 ]]; then
+    echo "ERROR: minisign is not installed and no local package was found." >&2
+    echo "Expected file pattern in installer directory: minisign_*.deb" >&2
+    echo "Directory checked: $INSTALLER_DIR" >&2
+    exit 1
+  fi
+
+  if [[ "${#packages[@]}" -eq 1 ]]; then
+    printf '%s\n' "${packages[0]}"
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    echo "ERROR: Multiple minisign packages found, but installer is not interactive." >&2
+    echo "Keep only one minisign_*.deb in: $INSTALLER_DIR" >&2
+    exit 1
+  fi
+
+  echo "Multiple minisign packages found. Select one to install:" >&2
+  for idx in "${!packages[@]}"; do
+    printf '  %d) %s\n' "$((idx + 1))" "$(basename "${packages[$idx]}")" >&2
+  done
+
+  while true; do
+    printf 'Enter selection [1-%d]: ' "${#packages[@]}" >&2
+    read -r choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#packages[@]} )); then
+      printf '%s\n' "${packages[$((choice - 1))]}"
+      return 0
+    fi
+    echo "Invalid selection. Try again." >&2
+  done
+}
+
+ensure_minisign() {
+  local pkg_path=""
+
+  if command -v minisign >/dev/null 2>&1; then
+    echo "minisign already installed"
+    return 0
+  fi
+
+  pkg_path="$(choose_minisign_package)"
+  echo "Installing minisign from local package: $(basename "$pkg_path")"
+
+  if ! dpkg -i "$pkg_path"; then
+    echo "ERROR: Failed to install minisign package: $pkg_path"
+    echo "Resolve package dependency issues and run installer again."
+    exit 1
+  fi
+
+  if ! command -v minisign >/dev/null 2>&1; then
+    echo "ERROR: minisign still not available after package install."
+    exit 1
+  fi
+
+  echo "minisign installation verified"
+}
+
+ensure_pubkey_available() {
+  if [[ -r "$PUBKEYPATH" ]]; then
+    echo "public key already present at $PUBKEYPATH"
+    return 0
+  fi
+
+  if [[ ! -r "$LOCAL_PUBKEY_PATH" ]]; then
+    echo "ERROR: Public key not found."
+    echo "Expected either:"
+    echo "  - Existing key on host: $PUBKEYPATH"
+    echo "  - Local key next to installer: $LOCAL_PUBKEY_PATH"
+    exit 1
+  fi
+
+  echo "public key found next to installer"
+}
+
+ensure_runtime_dependencies() {
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "ERROR: sha256sum is required on the Pi for hash verification."
+    echo "Install coreutils and run installer again."
+    exit 1
+  fi
+}
+
+check_existing_paths() {
+  if [[ -e "$PISCRIPTPATH" ]]; then
     echo "ERROR: $PISCRIPTPATH already exists. Aborting installation"
     exit 1
-fi
+  fi
 
-# check if udev rule file already exists
-if [ -e "$UDEVRULEPATH" ]; then
+  if [[ -e "$UDEVRULEPATH" ]]; then
     echo "ERROR: $UDEVRULEPATH already exists. Aborting installation"
     exit 1
-fi
+  fi
 
-# check if service file already exists
-if [ -e "$SERVICEPATH" ]; then
+  if [[ -e "$SERVICEPATH" ]]; then
     echo "ERROR: $SERVICEPATH already exists. Aborting installation"
     exit 1
-fi
+  fi
 
-# check if logfile already exists
-if [ -e "$LOGFILEPATH" ]; then
+  if [[ -e "$LOGFILEPATH" ]]; then
     echo "ERROR: $LOGFILEPATH already exists. Aborting installation"
     exit 1
-fi
+  fi
+}
 
-
-# ===== CREATE SCRIPT FILE =====
-# write script file
-cat << 'EOF' > "$PISCRIPTPATH"
+install_handler_script() {
+  cat << 'EOF_HANDLER' > "$PISCRIPTPATH"
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -55,12 +148,18 @@ set -euo pipefail
 # USB Recovery Handler (udev/systemd triggered)
 #
 # Purpose:
-#   Automatically detect an approved USB recovery stick and execute a recovery
-#   script stored on it.
+#   Automatically detect an approved USB recovery stick and execute a signed
+#   recovery script stored on it.
+#
+# Security gates:
+#   A) Volume label match
+#   B) minisign verifies manifest signature with Pi-stored public key
+#   C) Signed manifest format + path policy validation
+#   D) Referenced recovery script hash matches manifest
+#   E) All module hashes in scripts/modules are validated + full coverage check
 #
 # Designed for Windows-prepared USB sticks (FAT32/exFAT):
 #   - No reliance on Linux executable permissions
-#   - Validation via volume label + token file content
 #   - Recovery script executed explicitly using /bin/bash
 #
 # Logging:
@@ -69,36 +168,47 @@ set -euo pipefail
 #   - Captures recovery script output to both Pi and USB logfile
 # =============================================================================
 
-
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-# Required USB filesystem label (set in Windows formatting / rename step)
 EXPECTED_USB_LABEL="RECOVERYKEY"
-
-# Mount location on the Raspberry Pi
 MOUNT_POINT="/mnt/usb-recovery"
 
-# Recovery script location on the USB stick (relative to USB root)
-TARGET_DIR="scripts"
-TARGET_FILE="RECOVERY.sh"
+EXPECTED_SCRIPT_RELATIVE_PATH="scripts/RECOVERY.sh"
+EXPECTED_MODULES_DIR_RELATIVE_PATH="scripts/modules"
+MANIFEST_RELATIVE_PATH="scripts/manifest.sha256"
+MANIFEST_SIG_RELATIVE_PATH="scripts/manifest.sha256.minisig"
 
-# Token file used as an additional authorization gate
-TOKEN_RELATIVE_PATH="scripts/COBOD_TOKEN.txt"
-EXPECTED_TOKEN_CONTENT="COBOD_RECOVERY_OK_v1"
+PUBKEY_PATH="/etc/usb-recovery/cobod_recovery.pub"
 
-# Log files
 PI_LOG_FILE="/var/log/usb-recovery.log"
 USB_LOG_RELATIVE_PATH="scripts/output/pi-recovery.log"
-
+MOUNT_ERR_FILE="/tmp/usb-recovery-mount.err"
 
 # =============================================================================
-# LOGGING HELPERS
+# RUNTIME STATE
 # =============================================================================
 
-DEVNAME="${1:-}"          # Passed from udev/systemd, e.g. /dev/sda1
+DEVNAME="${1:-}"
 LOGTAG="usb-recovery"
+
+USB_LABEL="N/A"
+TARGET_PATH="N/A"
+MANIFEST_PATH="N/A"
+MANIFEST_SIG_PATH="N/A"
+USB_LOG_PATH=""
+
+EXISTING_MNT=""
+MOUNTED_BY_HANDLER="false"
+
+START_LOGGED="false"
+END_LOGGED="false"
+
+MANIFEST_SIG_STATUS="NOT_RUN"
+MANIFEST_CONTENT_STATUS="NOT_RUN"
+SCRIPT_HASH_STATUS="NOT_RUN"
+MODULE_HASH_STATUS="NOT_RUN"
 
 ts() { date -Is; }
 
@@ -110,9 +220,16 @@ log_pi() {
   printf '%s %s\n' "$(ts)" "$*" >>"$PI_LOG_FILE"
 }
 
+log_usb() {
+  if [[ -n "$USB_LOG_PATH" ]]; then
+    printf '%s %s\n' "$(ts)" "$*" >>"$USB_LOG_PATH" 2>/dev/null || true
+  fi
+}
+
 log_all() {
   log_sys "$*"
   log_pi "$*"
+  log_usb "$*"
 }
 
 log_block_start() {
@@ -123,20 +240,33 @@ log_block_start() {
     echo "Device                   : $DEVNAME"
     echo "USB Label                : ${USB_LABEL:-N/A}"
     echo "Mount Point              : ${MOUNT_POINT:-N/A}"
+    echo "Manifest Signature       : ${MANIFEST_SIG_STATUS:-N/A}"
+    echo "Manifest Content         : ${MANIFEST_CONTENT_STATUS:-N/A}"
+    echo "Script Hash              : ${SCRIPT_HASH_STATUS:-N/A}"
+    echo "Module Hashes            : ${MODULE_HASH_STATUS:-N/A}"
     echo "Recovery Script          : ${TARGET_PATH:-N/A}"
     echo "================================================================="
   } >>"$PI_LOG_FILE"
 
-  {
-    echo ""
-    echo "================================================================="
-    echo "USB RECOVERY HANDLER START : $(ts)"
-    echo "Device                   : $DEVNAME"
-    echo "USB Label                : ${USB_LABEL:-N/A}"
-    echo "Mount Point              : ${MOUNT_POINT:-N/A}"
-    echo "Recovery Script          : ${TARGET_PATH:-N/A}"
-    echo "================================================================="
-  } >>"$USB_LOG_PATH"
+  if [[ -n "$USB_LOG_PATH" ]]; then
+    {
+      echo ""
+      echo "================================================================="
+      echo "USB RECOVERY HANDLER START : $(ts)"
+      echo "Device                   : $DEVNAME"
+      echo "USB Label                : ${USB_LABEL:-N/A}"
+      echo "Mount Point              : ${MOUNT_POINT:-N/A}"
+      echo "Manifest Signature       : ${MANIFEST_SIG_STATUS:-N/A}"
+      echo "Manifest Content         : ${MANIFEST_CONTENT_STATUS:-N/A}"
+      echo "Script Hash              : ${SCRIPT_HASH_STATUS:-N/A}"
+      echo "Module Hashes            : ${MODULE_HASH_STATUS:-N/A}"
+      echo "Recovery Script          : ${TARGET_PATH:-N/A}"
+      echo "================================================================="
+    } >>"$USB_LOG_PATH" 2>/dev/null || true
+  fi
+
+  log_sys "START device=$DEVNAME label=${USB_LABEL:-N/A} mount=${MOUNT_POINT:-N/A} manifest_sig=$MANIFEST_SIG_STATUS manifest_content=$MANIFEST_CONTENT_STATUS script_hash=$SCRIPT_HASH_STATUS module_hash=$MODULE_HASH_STATUS script=${TARGET_PATH:-N/A}"
+  START_LOGGED="true"
 }
 
 log_block_end() {
@@ -145,40 +275,84 @@ log_block_end() {
   {
     echo "================================================================="
     echo "USB RECOVERY HANDLER END   : $(ts)"
+    echo "Manifest Signature       : ${MANIFEST_SIG_STATUS:-N/A}"
+    echo "Manifest Content         : ${MANIFEST_CONTENT_STATUS:-N/A}"
+    echo "Script Hash              : ${SCRIPT_HASH_STATUS:-N/A}"
+    echo "Module Hashes            : ${MODULE_HASH_STATUS:-N/A}"
     echo "Exit Code                : $rc"
     echo "================================================================="
     echo ""
   } >>"$PI_LOG_FILE"
 
-  {
-    echo "================================================================="
-    echo "USB RECOVERY HANDLER END   : $(ts)"
-    echo "Exit Code                : $rc"
-    echo "================================================================="
-    echo ""
-  } >>"$USB_LOG_PATH"
+  if [[ -n "$USB_LOG_PATH" ]]; then
+    {
+      echo "================================================================="
+      echo "USB RECOVERY HANDLER END   : $(ts)"
+      echo "Manifest Signature       : ${MANIFEST_SIG_STATUS:-N/A}"
+      echo "Manifest Content         : ${MANIFEST_CONTENT_STATUS:-N/A}"
+      echo "Script Hash              : ${SCRIPT_HASH_STATUS:-N/A}"
+      echo "Module Hashes            : ${MODULE_HASH_STATUS:-N/A}"
+      echo "Exit Code                : $rc"
+      echo "================================================================="
+      echo ""
+    } >>"$USB_LOG_PATH" 2>/dev/null || true
+  fi
+
+  log_sys "END rc=$rc device=$DEVNAME label=${USB_LABEL:-N/A} mount=${MOUNT_POINT:-N/A} manifest_sig=$MANIFEST_SIG_STATUS manifest_content=$MANIFEST_CONTENT_STATUS script_hash=$SCRIPT_HASH_STATUS module_hash=$MODULE_HASH_STATUS"
+  END_LOGGED="true"
 }
 
+cleanup_mount() {
+  if [[ "$MOUNTED_BY_HANDLER" == "true" ]]; then
+    sync || true
+    if mountpoint -q "$MOUNT_POINT"; then
+      sync -f "$MOUNT_POINT" 2>/dev/null || true
+      sleep 1
+      umount "$MOUNT_POINT" 2>/dev/null || true
+      sleep 1
+    fi
+  fi
+}
+
+on_exit() {
+  local rc="$?"
+
+  if [[ "$START_LOGGED" == "true" && "$END_LOGGED" != "true" ]]; then
+    log_block_end "$rc"
+  fi
+
+  cleanup_mount
+}
+
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+exit_with() {
+  local rc="$1"
+  shift || true
+  if [[ "$#" -gt 0 ]]; then
+    log_all "$*"
+  fi
+  exit "$rc"
+}
 
 # =============================================================================
 # INPUT VALIDATION
 # =============================================================================
 
-# Ensure a device was provided
 if [[ -z "$DEVNAME" ]]; then
   log_all "No device passed; exiting."
   exit 0
 fi
 
-# Only handle partitions like /dev/sda1, not whole disks like /dev/sda
 if [[ ! "$DEVNAME" =~ ^/dev/sd[a-z][0-9]+$ ]]; then
   log_all "Ignoring non-partition device: $DEVNAME"
   exit 0
 fi
 
-
 # =============================================================================
-# USB LABEL VERIFICATION
+# GATE A - USB LABEL VERIFICATION
 # =============================================================================
 
 USB_LABEL="$(blkid -o value -s LABEL "$DEVNAME" 2>/dev/null || true)"
@@ -195,118 +369,228 @@ fi
 
 log_all "USB label OK on $DEVNAME: '$USB_LABEL'"
 
-
 # =============================================================================
 # MOUNT HANDLING (RW, WITH AUTOMOUNT DETECTION + RETRIES)
 # =============================================================================
 
 mkdir -p "$MOUNT_POINT"
 
-# If already mounted somewhere (e.g. desktop automount), reuse that mountpoint
 EXISTING_MNT="$(findmnt -nr -S "$DEVNAME" -o TARGET 2>/dev/null || true)"
 if [[ -n "$EXISTING_MNT" ]]; then
-  log_all "Device $DEVNAME is already mounted at $EXISTING_MNT; reusing it."
   MOUNT_POINT="$EXISTING_MNT"
+  log_all "Device $DEVNAME is already mounted at $EXISTING_MNT; reusing it."
 else
-  # Retry mount a few times to avoid race conditions
   MOUNT_ERR=""
   for i in 1 2 3 4 5; do
-    if mount -o rw "$DEVNAME" "$MOUNT_POINT" 2>/tmp/usb-recovery-mount.err; then
-      log_all "Mounted $DEVNAME at $MOUNT_POINT (rw)."
+    if mount -o rw "$DEVNAME" "$MOUNT_POINT" 2>"$MOUNT_ERR_FILE"; then
+      MOUNTED_BY_HANDLER="true"
       MOUNT_ERR=""
+      log_all "Mounted $DEVNAME at $MOUNT_POINT (rw)."
       break
-    else
-      MOUNT_ERR="$(cat /tmp/usb-recovery-mount.err 2>/dev/null || true)"
-      log_all "Mount attempt $i/5 failed for $DEVNAME (rw): ${MOUNT_ERR:-unknown error}"
-      sleep 1
     fi
+    MOUNT_ERR="$(cat "$MOUNT_ERR_FILE" 2>/dev/null || true)"
+    log_all "Mount attempt $i/5 failed for $DEVNAME (rw): ${MOUNT_ERR:-unknown error}"
+    sleep 1
   done
 
   if [[ -n "$MOUNT_ERR" ]]; then
-    log_all "Failed to mount $DEVNAME (rw) after retries. Last error: ${MOUNT_ERR:-unknown}"
-    exit 0
+    exit_with 1 "Failed to mount $DEVNAME (rw) after retries. Last error: ${MOUNT_ERR:-unknown}"
   fi
 fi
 
-cleanup() {
-  # Only unmount if we mounted it ourselves
-  if [[ -z "${EXISTING_MNT:-}" ]]; then
-    # Flush filesystem buffers (best-effort)
-    sync || true
-
-    # If still mounted, try to flush just that mount (best-effort)
-    if mountpoint -q "$MOUNT_POINT"; then
-      sync -f "$MOUNT_POINT" 2>/dev/null || true
-    fi
-
-    # Give the kernel/USB stack a moment to settle (helps on some sticks)
-    sleep 1
-
-    # Unmount (best-effort)
-    umount "$MOUNT_POINT" 2>/dev/null || true
-
-    # Optional: extra delay after unmount to reduce "still busy" cases
-    sleep 1
-  fi
-}
-
-# Run cleanup on normal exit and common termination signals
-trap cleanup EXIT INT TERM
-
-
 # =============================================================================
-# FILE VALIDATION (RECOVERY SCRIPT + TOKEN)
+# FILE PATHS + USB LOG INITIALIZATION
 # =============================================================================
 
-TARGET_PATH="$MOUNT_POINT/$TARGET_DIR/$TARGET_FILE"
-TOKEN_PATH="$MOUNT_POINT/$TOKEN_RELATIVE_PATH"
+TARGET_PATH="$MOUNT_POINT/$EXPECTED_SCRIPT_RELATIVE_PATH"
+MANIFEST_PATH="$MOUNT_POINT/$MANIFEST_RELATIVE_PATH"
+MANIFEST_SIG_PATH="$MOUNT_POINT/$MANIFEST_SIG_RELATIVE_PATH"
 USB_LOG_PATH="$MOUNT_POINT/$USB_LOG_RELATIVE_PATH"
 
+if ! mkdir -p "$(dirname "$USB_LOG_PATH")" 2>/dev/null; then
+  USB_LOG_PATH=""
+  exit_with 1 "Unable to create USB log directory under mount point."
+fi
+
+if ! touch "$USB_LOG_PATH" 2>/dev/null; then
+  USB_LOG_PATH=""
+  exit_with 1 "Unable to create USB log file under mount point."
+fi
+
+log_block_start
+
+# =============================================================================
+# DEPENDENCY CHECKS
+# =============================================================================
+
+if ! command -v minisign >/dev/null 2>&1; then
+  MANIFEST_SIG_STATUS="FAIL_NO_MINISIGN"
+  exit_with 1 "minisign is not installed on the Pi; cannot verify manifest signature."
+fi
+
+if ! command -v sha256sum >/dev/null 2>&1; then
+  SCRIPT_HASH_STATUS="FAIL_NO_SHA256SUM"
+  MODULE_HASH_STATUS="FAIL_NO_SHA256SUM"
+  exit_with 1 "sha256sum is not available on this system."
+fi
+
+if [[ ! -r "$PUBKEY_PATH" ]]; then
+  MANIFEST_SIG_STATUS="FAIL_NO_PUBKEY"
+  exit_with 1 "Public key missing or unreadable: $PUBKEY_PATH"
+fi
+
+if [[ ! -f "$MANIFEST_PATH" ]]; then
+  MANIFEST_SIG_STATUS="FAIL_NO_MANIFEST"
+  MANIFEST_CONTENT_STATUS="FAIL_NO_MANIFEST"
+  exit_with 1 "Manifest file not found: $MANIFEST_PATH"
+fi
+
+if [[ ! -f "$MANIFEST_SIG_PATH" ]]; then
+  MANIFEST_SIG_STATUS="FAIL_NO_SIGNATURE"
+  exit_with 1 "Manifest signature file not found: $MANIFEST_SIG_PATH"
+fi
+
+# =============================================================================
+# GATE B - SIGNATURE VERIFICATION
+# =============================================================================
+
+if minisign -V -m "$MANIFEST_PATH" -x "$MANIFEST_SIG_PATH" -p "$PUBKEY_PATH" -q >/dev/null 2>&1; then
+  MANIFEST_SIG_STATUS="PASS"
+  log_all "Manifest signature verification: PASS"
+else
+  MANIFEST_SIG_STATUS="FAIL_BAD_SIGNATURE"
+  exit_with 1 "Manifest signature verification failed."
+fi
+
+# =============================================================================
+# GATE C - MANIFEST FORMAT + PATH POLICY
+# Manifest format:
+#   <sha256><two spaces><relative path>
+#   # comments and blank lines allowed
+# =============================================================================
+
+declare -A manifest_hashes=()
+manifest_script_hash=""
+
+while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+  line="${raw_line%$'\r'}"
+
+  [[ -z "$line" ]] && continue
+  [[ "$line" == \#* ]] && continue
+
+  if [[ ! "$line" =~ ^([A-Fa-f0-9]{64})[[:space:]][[:space:]](.+)$ ]]; then
+    MANIFEST_CONTENT_STATUS="FAIL_MALFORMED_LINE"
+    exit_with 1 "Manifest line is malformed: $line"
+  fi
+
+  entry_hash="${BASH_REMATCH[1],,}"
+  entry_path="${BASH_REMATCH[2]}"
+
+  if [[ "$entry_path" == "$EXPECTED_SCRIPT_RELATIVE_PATH" ]]; then
+    if [[ -n "$manifest_script_hash" ]]; then
+      MANIFEST_CONTENT_STATUS="FAIL_DUPLICATE_SCRIPT_ENTRY"
+      exit_with 1 "Manifest has duplicate RECOVERY.sh entry."
+    fi
+    manifest_script_hash="$entry_hash"
+    continue
+  fi
+
+  if [[ ! "$entry_path" =~ ^scripts/modules/[A-Za-z0-9._/-]+\.sh$ || "$entry_path" == *".."* ]]; then
+    MANIFEST_CONTENT_STATUS="FAIL_PATH_NOT_ALLOWED"
+    exit_with 1 "Manifest path is not allowed: $entry_path"
+  fi
+
+  if [[ -n "${manifest_hashes[$entry_path]+x}" ]]; then
+    MANIFEST_CONTENT_STATUS="FAIL_DUPLICATE_MODULE_ENTRY"
+    exit_with 1 "Manifest has duplicate module entry: $entry_path"
+  fi
+
+  manifest_hashes["$entry_path"]="$entry_hash"
+done < "$MANIFEST_PATH"
+
+if [[ -z "$manifest_script_hash" ]]; then
+  MANIFEST_CONTENT_STATUS="FAIL_MISSING_SCRIPT_ENTRY"
+  exit_with 1 "Manifest is missing RECOVERY.sh entry."
+fi
+
+MANIFEST_CONTENT_STATUS="PASS"
+
+# =============================================================================
+# GATE D - RECOVERY SCRIPT HASH VERIFICATION
+# =============================================================================
+
 if [[ ! -f "$TARGET_PATH" ]]; then
-  log_all "Recovery script not found: $TARGET_PATH"
-  exit 0
+  SCRIPT_HASH_STATUS="FAIL_SCRIPT_NOT_FOUND"
+  exit_with 1 "Recovery script not found: $TARGET_PATH"
 fi
 
-if [[ ! -f "$TOKEN_PATH" ]]; then
-  log_all "Token file not found: $TOKEN_PATH"
-  exit 0
+sha_line="$(sha256sum "$TARGET_PATH" 2>/dev/null || true)"
+actual_sha256="${sha_line%% *}"
+actual_sha256="${actual_sha256,,}"
+
+if [[ ! "$actual_sha256" =~ ^[a-f0-9]{64}$ ]]; then
+  SCRIPT_HASH_STATUS="FAIL_HASH_COMPUTE_ERROR"
+  exit_with 1 "Failed to compute sha256 for: $TARGET_PATH"
 fi
 
+if [[ "$actual_sha256" != "$manifest_script_hash" ]]; then
+  SCRIPT_HASH_STATUS="FAIL_HASH_MISMATCH"
+  exit_with 1 "Recovery script sha256 mismatch."
+fi
+
+SCRIPT_HASH_STATUS="PASS"
 
 # =============================================================================
-# TOKEN VALIDATION (CRLF-SAFE)
+# GATE E - MODULE HASH VERIFICATION + COVERAGE ENFORCEMENT
 # =============================================================================
 
-TOKEN_CONTENT="$(tr -d '\r\n' < "$TOKEN_PATH" 2>/dev/null || true)"
+declare -A actual_module_set=()
 
-if [[ -z "$TOKEN_CONTENT" ]]; then
-  log_all "Token file is empty or unreadable: $TOKEN_PATH"
-  exit 1
-fi
+shopt -s nullglob
+for module_abs in "$MOUNT_POINT/$EXPECTED_MODULES_DIR_RELATIVE_PATH"/*.sh; do
+  module_rel="${module_abs#$MOUNT_POINT/}"
+  actual_module_set["$module_rel"]="1"
 
-if [[ "$TOKEN_CONTENT" != "$EXPECTED_TOKEN_CONTENT" ]]; then
-  log_all "Token content mismatch; refusing. (file=$TOKEN_PATH)"
-  exit 1
-fi
+  if [[ -z "${manifest_hashes[$module_rel]+x}" ]]; then
+    MODULE_HASH_STATUS="FAIL_MODULE_NOT_LISTED"
+    shopt -u nullglob
+    exit_with 1 "Module exists on USB but is not listed in manifest: $module_rel"
+  fi
 
-log_all "Token OK."
+  module_sha_line="$(sha256sum "$module_abs" 2>/dev/null || true)"
+  module_actual_sha256="${module_sha_line%% *}"
+  module_actual_sha256="${module_actual_sha256,,}"
+  if [[ ! "$module_actual_sha256" =~ ^[a-f0-9]{64}$ ]]; then
+    MODULE_HASH_STATUS="FAIL_MODULE_HASH_COMPUTE"
+    shopt -u nullglob
+    exit_with 1 "Failed to compute sha256 for module: $module_rel"
+  fi
 
+  if [[ "$module_actual_sha256" != "${manifest_hashes[$module_rel]}" ]]; then
+    MODULE_HASH_STATUS="FAIL_MODULE_HASH_MISMATCH"
+    shopt -u nullglob
+    exit_with 1 "Module sha256 mismatch for: $module_rel"
+  fi
+done
+shopt -u nullglob
+
+for module_rel in "${!manifest_hashes[@]}"; do
+  if [[ -z "${actual_module_set[$module_rel]+x}" ]]; then
+    MODULE_HASH_STATUS="FAIL_MODULE_LIST_STALE"
+    exit_with 1 "Manifest lists module that is missing on USB: $module_rel"
+  fi
+done
+
+MODULE_HASH_STATUS="PASS"
+log_all "Manifest + script hash + module hash verification: PASS"
 
 # =============================================================================
 # EXECUTION
 # =============================================================================
 
-mkdir -p "$(dirname "$USB_LOG_PATH")" 2>/dev/null || true
-
-# Create USB logfile if it does not exist
-touch "$USB_LOG_PATH" 2>/dev/null || true
-
 log_all "Validation complete. Starting recovery execution."
 
-# Write structured header blocks to both log files
-log_block_start
-
-# Run recovery script and capture output to both logs
+set +e
 {
   echo ""
   echo "------------------------------------------------------------"
@@ -319,43 +603,33 @@ log_block_start
   echo "Exit Code                   : $RC"
   echo "------------------------------------------------------------"
   echo ""
-  exit $RC
+  exit "$RC"
 } 2>&1 | tee -a "$PI_LOG_FILE" >>"$USB_LOG_PATH"
-
-# Capture exit code of recovery script (from pipeline)
 RC=${PIPESTATUS[0]}
+set -e
 
-# Write structured footer blocks to both log files
+log_all "Handler finished (rc=$RC)."
 log_block_end "$RC"
 
-log_all "Handler finished successfully (rc=$RC)."
-
 exit "$RC"
+EOF_HANDLER
 
-EOF
+  chmod 755 "$PISCRIPTPATH"
+  echo "created script file"
+}
 
-# make executable
-chmod 755 "$PISCRIPTPATH"
-
-# return progress message
-echo "created script file"
-
-# ===== CREATE UDEV RULE =====
-# create rule file
-cat << EOF > "$UDEVRULEPATH"
+install_udev_rule() {
+  cat << 'EOF_UDEV' > "$UDEVRULEPATH"
 ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd*[0-9]", ENV{ID_BUS}=="usb", ENV{SYSTEMD_WANTS}="usb-recovery@%k.service"
-EOF
+EOF_UDEV
 
-# reload udev
-udevadm trigger
-udevadm control --reload-rules
+  udevadm control --reload-rules
+  udevadm trigger
+  echo "created udev rule"
+}
 
-# return progress message
-echo "created udev rule"
-
-# ===== CREATE SYSTEM SERVICE =====
-# create service file
-cat << 'EOF' > "$SERVICEPATH"
+install_systemd_service() {
+  cat << 'EOF_SERVICE' > "$SERVICEPATH"
 [Unit]
 Description=USB Recovery Service for %I
 After=local-fs.target
@@ -367,32 +641,55 @@ TimeoutStartSec=5min
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF_SERVICE
 
-# reload systemd
-systemctl daemon-reload
+  systemctl daemon-reload
+  echo "created service"
+}
 
-# return progress message
-echo "created service"
+prepare_mount_dir() {
+  mkdir -p "$USBMOUNTDIR"
+  chmod 755 "$USBMOUNTDIR"
+  echo "created mount dir"
+}
 
-# ===== CREATE MOUNT DIRECTORY =====
-# create directory
-mkdir -p "$USBMOUNTDIR"
+prepare_log_file() {
+  touch "$LOGFILEPATH"
+  chmod 644 "$LOGFILEPATH"
+  echo "initialised log file"
+}
 
-# set permissions
-chmod 755 "$USBMOUNTDIR"
+install_pubkey() {
+  if [[ -r "$PUBKEYPATH" ]]; then
+    echo "public key already present on host"
+    return 0
+  fi
 
-# return progress message
-echo "created mount dir"
+  mkdir -p "$PUBKEYDIR"
+  chmod 755 "$PUBKEYDIR"
 
-# ===== CREATE LOGGING FILE =====
-touch "$LOGFILEPATH"
-chmod 644 "$LOGFILEPATH"
+  cp "$LOCAL_PUBKEY_PATH" "$PUBKEYPATH"
+  chmod 644 "$PUBKEYPATH"
+  echo "installed public key"
+}
 
-# return progress message
-echo "initialised log file"
+main() {
+  check_root
 
-# ===== DONE =====
-# send final message
-echo "installation complete"
-exit 0
+  # Required before any installation writes
+  ensure_minisign
+  ensure_runtime_dependencies
+  ensure_pubkey_available
+
+  check_existing_paths
+  install_handler_script
+  install_udev_rule
+  install_systemd_service
+  prepare_mount_dir
+  prepare_log_file
+  install_pubkey
+
+  echo "installation complete"
+}
+
+main "$@"
